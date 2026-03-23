@@ -70,12 +70,18 @@ export async function checkSiretsInCRM(sirets: string[]): Promise<Set<string>> {
   return foundSirets;
 }
 
+/** Max companies per OData RetrieveMultiple call (keeps URL length safe). */
+const MATCH_BATCH_SIZE = 20;
+
+/** GUID regex used to extract primary key values from OData responses. */
+const GUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+
 /**
  * Check which companies already exist in the CRM using the dynamic matching
  * fields defined in the `carfup_altaresmappings` table (useForMatching = true).
  *
- * For each company, builds an OData filter where ALL matching fields must match
- * (AND logic). Returns a Set of company IDs that were found.
+ * Builds batched OData filters (compound OR of per-company AND clauses) so that
+ * N companies are checked in ~ceil(N / MATCH_BATCH_SIZE) requests instead of N.
  *
  * Falls back to SIRET-only matching when no mapping is provided.
  */
@@ -99,43 +105,89 @@ export async function checkCompaniesInCRM(
     return result;
   }
 
-  // Select only the CRM fields we need to compare
+  // CRM fields we need in the response to compare & extract the primary key
   const selectFields = [...new Set(matchingFields.map((m) => m.fieldTo as string))];
-  const foundMap = new Map<string, string>();
+
+  // ── Step 1: Build per-company filter clauses & collect matchable companies ──
+  interface CompanyFilter {
+    company: Company;
+    /** Per-field expected values (CRM field → sanitized value string). */
+    expected: Map<string, string>;
+    /** Full OData sub-clause: "(field1 eq 'v1' and field2 eq 'v2')" */
+    clause: string;
+  }
+
+  const companyFilters: CompanyFilter[] = [];
 
   for (const company of companies) {
     const raw = company.rawAltaresData;
     if (!raw) continue;
 
-    // Build filter: all matching fields ANDed together
-    const filterParts: string[] = [];
+    const expected = new Map<string, string>();
+    const parts: string[] = [];
     for (const mf of matchingFields) {
       const value = raw[mf.fieldFrom];
       if (value === undefined || value === null || value === '') continue;
-      filterParts.push(`${mf.fieldTo} eq '${sanitizeODataValue(String(value))}'`);
+      const strValue = String(value);
+      expected.set(mf.fieldTo as string, strValue);
+      parts.push(`${mf.fieldTo} eq '${sanitizeODataValue(strValue)}'`);
     }
 
-    if (filterParts.length === 0) continue;
+    if (parts.length === 0) continue;
 
-    const filter = filterParts.join(' and ');
-    const path = `${entitySet}?$select=${selectFields.join(',')}&$filter=${filter}&$top=1`;
+    companyFilters.push({
+      company,
+      expected,
+      clause: parts.length === 1 ? parts[0] : `(${parts.join(' and ')})`,
+    });
+  }
+
+  if (companyFilters.length === 0) {
+    logger.info('Dataverse', 'No companies with usable matching data — skipping CRM check.');
+    return new Map<string, string>();
+  }
+
+  // ── Step 2: Batch companies & execute one RetrieveMultiple per batch ────────
+  const foundMap = new Map<string, string>();
+
+  for (let i = 0; i < companyFilters.length; i += MATCH_BATCH_SIZE) {
+    const batch = companyFilters.slice(i, i + MATCH_BATCH_SIZE);
+    const combinedFilter = batch.map((cf) => cf.clause).join(' or ');
+    const path = `${entitySet}?$select=${selectFields.join(',')}&$filter=${combinedFilter}`;
 
     try {
       const result = await dataverseGet<ODataCollectionResponse>(path);
-      if (result.value.length > 0) {
-        // Extract the primary key (first GUID-like value in the record)
-        const record = result.value[0];
+
+      // ── Step 3: Map returned CRM records back to companies in-memory ──
+      for (const record of result.value) {
         const recordId = Object.values(record).find(
-          (v) => typeof v === 'string' && /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(v),
+          (v) => typeof v === 'string' && GUID_RE.test(v),
         ) as string | undefined;
-        foundMap.set(company.id, recordId || '');
+
+        for (const cf of batch) {
+          if (foundMap.has(cf.company.id)) continue; // already matched
+
+          const allMatch = [...cf.expected.entries()].every(([field, expectedVal]) => {
+            const crmVal = record[field];
+            if (crmVal === undefined || crmVal === null) return false;
+            return String(crmVal).toLowerCase() === expectedVal.toLowerCase();
+          });
+
+          if (allMatch) {
+            foundMap.set(cf.company.id, recordId || '');
+          }
+        }
       }
     } catch (error) {
-      logger.error('Dataverse', `Matching query failed for "${company.companyName}":`, error);
+      logger.error('Dataverse', `Batch matching query failed (batch ${Math.floor(i / MATCH_BATCH_SIZE) + 1}):`, error);
     }
   }
 
-  logger.info('Dataverse', `${foundMap.size} record(s) found in the CRM out of ${companies.length} checked (dynamic matching).`);
+  logger.info(
+    'Dataverse',
+    `${foundMap.size} record(s) found in the CRM out of ${companies.length} checked ` +
+      `(${Math.ceil(companyFilters.length / MATCH_BATCH_SIZE)} query/queries for ${companyFilters.length} matchable companies).`,
+  );
   return foundMap;
 }
 
@@ -154,7 +206,7 @@ export async function createAccountInCRM(
 
   if (mappings && mappings.length > 0 && company.rawAltaresData) {
     // Dynamic mapping from the carfup_altaresmappings table, with type-aware formatting
-    body = buildCrmPayload(company.rawAltaresData, mappings, attributeMetadata);
+    body = await buildCrmPayload(company.rawAltaresData, mappings, attributeMetadata);
     logger.info('Dataverse', `Dynamic mapping produced ${Object.keys(body).length} field(s) for SIRET ${company.siret}`);
   } else {
     // Fallback — hard-coded mapping (backward-compatible)
@@ -192,7 +244,7 @@ export async function updateRecordInCRM(
   let body: Record<string, unknown>;
 
   if (mappings && mappings.length > 0 && company.rawAltaresData) {
-    body = buildCrmPayload(company.rawAltaresData, mappings, attributeMetadata);
+    body = await buildCrmPayload(company.rawAltaresData, mappings, attributeMetadata);
     logger.info('Dataverse', `Dynamic mapping produced ${Object.keys(body).length} field(s) for update on ${crmRecordId}`);
   } else {
     body = {

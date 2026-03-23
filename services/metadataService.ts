@@ -1,4 +1,4 @@
-import { dataverseGet } from './dataverseClient';
+import { dataverseGet, sanitizeODataValue } from './dataverseClient';
 import { logger } from '../utils/logger';
 
 // ─── Dataverse attribute types (from EntityDefinitions/Attributes API) ────────
@@ -27,6 +27,12 @@ export type CrmFieldType =
   | 'UniqueIdentifier'
   | 'Unknown';
 
+/** A single option in a Picklist / State / Status field. */
+export interface PicklistOption {
+  value: number;
+  label: string;
+}
+
 /** Information about one CRM attribute retrieved from entity metadata. */
 export interface CrmAttributeMetadata {
   logicalName: string;
@@ -34,6 +40,15 @@ export interface CrmAttributeMetadata {
   displayName?: string;
   /** For Lookup/Customer/Owner attributes — target entity names. */
   targets?: string[];
+  /** For Picklist/State/Status attributes — available option values. */
+  options?: PicklistOption[];
+}
+
+/** Resolved information about a lookup target entity. */
+export interface LookupEntityInfo {
+  entityLogicalName: string;
+  entitySetName: string;
+  primaryNameAttribute: string;
 }
 
 /** Raw attribute shape returned by the Dataverse Metadata API. */
@@ -48,6 +63,21 @@ interface DataverseAttributeResponse {
   };
   Targets?: string[];
   [key: string]: unknown;
+}
+
+/** Raw picklist attribute shape returned by the Dataverse OptionSet expansion. */
+interface PicklistAttributeResponse {
+  LogicalName: string;
+  OptionSet?: {
+    Options: {
+      Value: number;
+      Label?: {
+        UserLocalizedLabel?: {
+          Label: string;
+        };
+      };
+    }[];
+  };
 }
 
 // ─── In-memory cache (keyed by entity logical name) ──────────────────────────
@@ -142,6 +172,9 @@ export async function loadAttributeMetadata(
       });
     }
 
+    // Load picklist / state / status option values in a separate call
+    await loadPicklistOptions(entityLogicalName, attrMap);
+
     metadataCache.set(entityLogicalName, attrMap);
     logger.info(
       'Metadata',
@@ -159,9 +192,109 @@ export async function loadAttributeMetadata(
   }
 }
 
+/**
+ * Fetch OptionSet values for all Picklist / State / Status attributes and
+ * merge them into the already-loaded attribute metadata map.
+ */
+async function loadPicklistOptions(
+  entityLogicalName: string,
+  attrMap: Map<string, CrmAttributeMetadata>,
+): Promise<void> {
+  const picklistFields = [...attrMap.values()].filter(
+    (a) => a.attributeType === 'Picklist' || a.attributeType === 'State' || a.attributeType === 'Status',
+  );
+  if (picklistFields.length === 0) return;
+
+  try {
+    const query =
+      `EntityDefinitions(LogicalName='${entityLogicalName}')/Attributes/` +
+      `Microsoft.Dynamics.CRM.PicklistAttributeMetadata` +
+      `?$select=LogicalName&$expand=OptionSet($select=Options)`;
+
+    const response = await dataverseGet<{ value: PicklistAttributeResponse[] }>(query);
+
+    let enriched = 0;
+    for (const attr of response.value) {
+      const meta = attrMap.get(attr.LogicalName);
+      if (!meta || !attr.OptionSet?.Options) continue;
+
+      meta.options = attr.OptionSet.Options
+        .map((opt) => ({
+          value: opt.Value,
+          label: opt.Label?.UserLocalizedLabel?.Label ?? '',
+        }))
+        .filter((o) => o.label !== '');
+
+      if (meta.options.length > 0) enriched++;
+    }
+
+    logger.info('Metadata', `Enriched ${enriched} picklist attribute(s) with option values for "${entityLogicalName}".`);
+  } catch (error) {
+    logger.warn('Metadata', `Could not load picklist options for "${entityLogicalName}" — label-based matching will be unavailable.`, error);
+  }
+}
+
 /** Clear the metadata cache (e.g. when the target entity changes). */
 export function clearMetadataCache(): void {
   metadataCache.clear();
+  lookupEntityCache.clear();
+}
+
+// ─── Lookup target resolution ────────────────────────────────────────────────
+
+const lookupEntityCache = new Map<string, LookupEntityInfo>();
+
+/**
+ * Resolve the EntitySetName and PrimaryNameAttribute for a given entity.
+ * Results are cached per entity for the session lifetime.
+ */
+export async function resolveLookupTarget(entityLogicalName: string): Promise<LookupEntityInfo | null> {
+  const cached = lookupEntityCache.get(entityLogicalName);
+  if (cached) return cached;
+
+  try {
+    const response = await dataverseGet<{ EntitySetName: string; PrimaryNameAttribute: string }>(
+      `EntityDefinitions(LogicalName='${entityLogicalName}')?$select=EntitySetName,PrimaryNameAttribute`,
+    );
+
+    const info: LookupEntityInfo = {
+      entityLogicalName,
+      entitySetName: response.EntitySetName,
+      primaryNameAttribute: response.PrimaryNameAttribute,
+    };
+    lookupEntityCache.set(entityLogicalName, info);
+    logger.info('Metadata', `Resolved lookup target "${entityLogicalName}" → set="${info.entitySetName}", primaryName="${info.primaryNameAttribute}".`);
+    return info;
+  } catch (error) {
+    logger.warn('Metadata', `Could not resolve lookup target entity "${entityLogicalName}".`, error);
+    return null;
+  }
+}
+
+/**
+ * Search for a record in a target entity by its primary name attribute.
+ * Returns the record GUID if found, or null.
+ */
+export async function searchRecordByName(
+  lookupInfo: LookupEntityInfo,
+  nameValue: string,
+): Promise<string | null> {
+  const filter = `${lookupInfo.primaryNameAttribute} eq '${sanitizeODataValue(nameValue)}'`;
+  const path = `${lookupInfo.entitySetName}?$select=${lookupInfo.primaryNameAttribute}&$filter=${filter}&$top=1`;
+
+  try {
+    const result = await dataverseGet<{ value: Record<string, unknown>[] }>(path);
+    if (result.value.length === 0) return null;
+
+    const record = result.value[0];
+    const guid = Object.values(record).find(
+      (v) => typeof v === 'string' && /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(v),
+    ) as string | undefined;
+    return guid ?? null;
+  } catch (error) {
+    logger.warn('Metadata', `Lookup search failed for "${nameValue}" in ${lookupInfo.entitySetName}.`, error);
+    return null;
+  }
 }
 
 /**

@@ -1,5 +1,5 @@
 import { dataverseGet } from './dataverseClient';
-import { CrmAttributeMetadata, CrmFieldType } from './metadataService';
+import { CrmAttributeMetadata, resolveLookupTarget, searchRecordByName } from './metadataService';
 import { logger } from '../utils/logger';
 
 // ─── Dataverse entity for Altares ↔ CRM field mapping ────────────────────────
@@ -72,13 +72,14 @@ export function clearMappingCache(): void {
  *
  * When `attributeMetadata` is provided, each value is coerced / formatted
  * to match the CRM target field type (Integer, Decimal, Boolean, DateTime, etc.).
+ * Lookup fields are resolved asynchronously by searching the target entity.
  * Without metadata, values are passed through as-is (string).
  */
-export function buildCrmPayload(
+export async function buildCrmPayload(
   rawAltaresData: Record<string, unknown>,
   mappings: AltaresFieldMapping[],
   attributeMetadata?: Map<string, CrmAttributeMetadata>,
-): Record<string, unknown> {
+): Promise<Record<string, unknown>> {
   const payload: Record<string, unknown> = {};
 
   for (const mapping of mappings) {
@@ -88,9 +89,15 @@ export function buildCrmPayload(
 
     const meta = attributeMetadata?.get(mapping.fieldTo);
     if (meta) {
-      const formatted = formatValueForCrmType(value, meta.attributeType, mapping.fieldTo);
+      const formatted = await formatValueForCrmType(value, meta);
       if (formatted !== undefined) {
-        payload[mapping.fieldTo] = formatted;
+        // Lookup bind uses a special key format
+        if (formatted && typeof formatted === 'object' && 'bindPath' in (formatted as Record<string, unknown>)) {
+          const bind = formatted as { bindPath: string };
+          payload[`${mapping.fieldTo}@odata.bind`] = bind.bindPath;
+        } else {
+          payload[mapping.fieldTo] = formatted;
+        }
       }
     } else {
       // No metadata available — pass through as-is (backward compatible)
@@ -106,12 +113,13 @@ export function buildCrmPayload(
 /**
  * Coerce / format a raw Altares value to match the expected CRM field type.
  * Returns `undefined` when the value cannot be meaningfully converted.
+ * For Lookup fields, returns a `{ bindPath }` object when resolved.
  */
-function formatValueForCrmType(
+async function formatValueForCrmType(
   rawValue: unknown,
-  targetType: CrmFieldType,
-  fieldName: string,
-): unknown {
+  meta: CrmAttributeMetadata,
+): Promise<unknown> {
+  const { attributeType: targetType, logicalName: fieldName } = meta;
   try {
     switch (targetType) {
       // --- Text fields ---
@@ -121,16 +129,35 @@ function formatValueForCrmType(
 
       // --- Whole numbers ---
       case 'Integer':
-      case 'BigInt':
-      case 'State':
-      case 'Status':
-      case 'Picklist': {
+      case 'BigInt': {
         const n = Number(rawValue);
         if (Number.isNaN(n)) {
           logger.warn('Mapping', `Cannot convert "${rawValue}" to integer for field "${fieldName}" — skipping.`);
           return undefined;
         }
         return Math.trunc(n);
+      }
+
+      // --- Picklist / State / Status (option set fields) ---
+      case 'Picklist':
+      case 'State':
+      case 'Status': {
+        // Already a number → use directly
+        const n = Number(rawValue);
+        if (!Number.isNaN(n)) {
+          return Math.trunc(n);
+        }
+        // Try to resolve a text label to its numeric option value
+        if (meta.options && meta.options.length > 0) {
+          const label = String(rawValue).toLowerCase().trim();
+          const match = meta.options.find((o) => o.label.toLowerCase() === label);
+          if (match) {
+            logger.debug('Mapping', `Resolved picklist label "${rawValue}" → ${match.value} for field "${fieldName}".`);
+            return match.value;
+          }
+        }
+        logger.warn('Mapping', `Cannot resolve "${rawValue}" to an option value for field "${fieldName}" — skipping.`);
+        return undefined;
       }
 
       // --- Decimal / floating-point numbers ---
@@ -181,12 +208,40 @@ function formatValueForCrmType(
       }
 
       // --- Lookup / Owner / Customer ---
-      // These require a special OData bind format: "/entityset(guid)"
-      // For now pass as-is; the caller may need to handle lookup binding separately.
+      // If already a GUID, build the bind path directly.
+      // Otherwise, search the target entity by primary name to resolve the GUID.
       case 'Lookup':
       case 'Owner':
-      case 'Customer':
-        return String(rawValue);
+      case 'Customer': {
+        const strVal = String(rawValue).trim();
+        const isGuid = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(strVal);
+        const targetEntity = meta.targets?.[0];
+        if (!targetEntity) {
+          logger.warn('Mapping', `No target entity defined for lookup field "${fieldName}" — skipping.`);
+          return undefined;
+        }
+
+        const lookupInfo = await resolveLookupTarget(targetEntity);
+        if (!lookupInfo) {
+          logger.warn('Mapping', `Cannot resolve lookup target "${targetEntity}" for field "${fieldName}" — skipping.`);
+          return undefined;
+        }
+
+        let guid: string | null;
+        if (isGuid) {
+          guid = strVal;
+        } else {
+          guid = await searchRecordByName(lookupInfo, strVal);
+          if (guid) {
+            logger.debug('Mapping', `Resolved lookup "${strVal}" → ${guid} in ${lookupInfo.entitySetName} for field "${fieldName}".`);
+          } else {
+            logger.warn('Mapping', `No record found for "${strVal}" in ${lookupInfo.entitySetName} (field "${fieldName}") — skipping.`);
+            return undefined;
+          }
+        }
+
+        return { bindPath: `/${lookupInfo.entitySetName}(${guid})` };
+      }
 
       // --- GUID ---
       case 'UniqueIdentifier':
