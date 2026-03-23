@@ -1,0 +1,5 @@
+{
+  "name": "InvestData Search",
+  "description": "A professional company search tool for investors to locate company details, SIRET, and CRM status.",
+  "requestFramePermissions": []
+}
