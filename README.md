@@ -4,6 +4,8 @@ A web resource for Microsoft Dynamics 365 / Dataverse that lets users search the
 
 Built with **React 18**, **Fluent UI 9**, **TypeScript**, and **Vite**.
 
+![IntuiZ–Altares Connector screenshot](https://carfupstorage.blob.core.windows.net/sharex/2026_03_25_20-31-25_msedge.png)
+
 ---
 
 ## Table of Contents
