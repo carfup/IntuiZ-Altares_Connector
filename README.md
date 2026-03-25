@@ -11,6 +11,7 @@ Built with **React 18**, **Fluent UI 9**, **TypeScript**, and **Vite**.
 - [Features](#features)
 - [Architecture Overview](#architecture-overview)
 - [CRM Configuration](#crm-configuration)
+  - [IntuiZ Credentials (carfup\_IntuiZCredentials)](#intuiz-credentials-carfup_intuizcredentials)
   - [Mapping Table (carfup\_altaresmappings)](#mapping-table-carfup_altaresmappings)
   - [Target Table Parameter](#target-table-parameter)
 - [User Guide](#user-guide)
@@ -74,6 +75,48 @@ Built with **React 18**, **Fluent UI 9**, **TypeScript**, and **Vite**.
 ---
 
 ## CRM Configuration
+
+### IntuiZ Credentials (`carfup_IntuiZCredentials`)
+
+The connector **does not store** IntuiZ API credentials in the source code. Instead, it reads them at runtime from a **Dataverse environment variable** named **`carfup_IntuiZCredentials`**.
+
+#### Setup
+
+1. In [make.powerapps.com](https://make.powerapps.com/), open your solution.
+2. Click **+ New** → **More** → **Environment variable**.
+3. Configure:
+
+   | Property | Value |
+   |---|---|
+   | **Display Name** | IntuiZ Credentials |
+   | **Schema Name** | `carfup_IntuiZCredentials` |
+   | **Data Type** | Text |
+   | **Default Value** or **Current Value** | *(see JSON below)* |
+
+4. Set the value to a JSON string containing the three required fields:
+
+   ```json
+   {
+     "login": "<your-intuiz-login>",
+     "password": "<your-intuiz-password>",
+     "refClient": "<your-ref-client>"
+   }
+   ```
+
+   All three fields (`login`, `password`, `refClient`) are **required** and must be non-empty strings. The connector validates them on first use and throws a descriptive error if any field is missing or the JSON is malformed.
+
+5. **Publish All Customizations** after saving the variable.
+
+#### How It Works
+
+- On the first IWS API call, the connector queries the Dataverse `environmentvariabledefinitions` endpoint to retrieve the variable value.
+- The **current value** (per-environment override) takes precedence over the **default value**.
+- Credentials are cached in memory for the duration of the page session — subsequent searches do not re-fetch them.
+- If the variable is missing or invalid, the search will fail with a clear error message in the browser console.
+
+> **Security Note:** Environment variables are a Dataverse-native mechanism for managing secrets. They can be scoped per environment (dev / test / prod) and their values are not exposed in source control.
+
+---
 
 ### Mapping Table (`carfup_altaresmappings`)
 
@@ -286,6 +329,8 @@ This generates optimized output in the `dist/` folder:
 | **"Could not load Altares→CRM mappings"** | Verify the `carfup_altaresmappings` table exists and has active rows (`statecode = 0`). Check the browser console for the full error. |
 | **"Could not resolve D365 base URL"** | The app is running outside Dynamics 365 or `ClientGlobalContext.js.aspx` is not loaded. Ensure the script reference is in `index.html`. |
 | **Search returns no results** | Verify at least Company Name or SIRET is filled. Check the browser console for IWS API errors (authentication, network). |
+| **"carfup_IntuiZCredentials not found"** | The environment variable does not exist. Create it in your solution as described in [IntuiZ Credentials](#intuiz-credentials-carfup_intuizcredentials). |
+| **"carfup_IntuiZCredentials … invalid JSON"** | The variable value is not valid JSON. Verify the format: `{ "login": "…", "password": "…", "refClient": "…" }`. |
 | **Records are created with missing fields** | Check the mapping table — ensure `carfup_fieldto` is set for each field you want to populate. Verify the Altares field names in `carfup_fieldfrom` match the raw API response. |
 | **"Some records failed"** | Expand the error message — it lists failures per company. Common causes: required fields missing, invalid field values, insufficient CRM privileges. |
 | **CRM link opens wrong entity** | Verify the `targettable` parameter matches the entity set name (OData plural). The connector resolves the entity logical name from `EntityDefinitions`. |

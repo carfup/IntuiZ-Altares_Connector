@@ -1,11 +1,103 @@
 import { SearchCriteria, Company } from '../types';
+import { dataverseGet } from './dataverseClient';
 import { logger } from '../utils/logger';
 
 // Configuration de l'API IWS-REST
 const IWS_BASE_URL = 'https://intuiz.altares.com/iws-rest';
-const IWS_USERNAME = '69a01fd31bb041e331dd9a92';
-const IWS_PASSWORD = 'kqB5eKJ7BjEYhy!'; // À remplacer par le vrai mot de passe
-const REF_CLIENT = '81775918611';
+
+// --- Credentials loaded from Dataverse environment variable ---
+
+interface IWSCredentials {
+  login: string;
+  password: string;
+  refClient: string;
+}
+
+/** Cached credentials promise — resolved once, then reused. */
+let credentialsPromise: Promise<IWSCredentials> | null = null;
+
+/**
+ * Fetch IntuiZ credentials from the Dataverse environment variable
+ * `carfup_IntuiZCredentials`. The value must be a JSON string containing
+ * { login, password, refClient }.
+ */
+async function fetchCredentials(): Promise<IWSCredentials> {
+  logger.info('IWS', 'Loading IntuiZ credentials from Dataverse environment variable...');
+
+  interface EnvVarValue { value?: string }
+  interface EnvVarDefinition {
+    defaultvalue?: string;
+    environmentvariabledefinition_environmentvariablevalue?: EnvVarValue[];
+  }
+  interface ODataResult { value: EnvVarDefinition[] }
+
+  const path =
+    "environmentvariabledefinitions?$filter=schemaname eq 'carfup_IntuiZCredentials'" +
+    '&$select=defaultvalue' +
+    '&$expand=environmentvariabledefinition_environmentvariablevalue($select=value)';
+
+  const result = await dataverseGet<ODataResult>(path);
+
+  if (!result.value || result.value.length === 0) {
+    throw new Error(
+      'Dataverse environment variable "carfup_IntuiZCredentials" not found. ' +
+      'Please create it in your environment with the required JSON value.',
+    );
+  }
+
+  const definition = result.value[0];
+  // Current value takes precedence over default value
+  const rawValue =
+    definition.environmentvariabledefinition_environmentvariablevalue?.[0]?.value
+    ?? definition.defaultvalue;
+
+  if (!rawValue) {
+    throw new Error(
+      'Dataverse environment variable "carfup_IntuiZCredentials" exists but has no value. ' +
+      'Please set a JSON value containing { login, password, refClient }.',
+    );
+  }
+
+  let parsed: Record<string, unknown>;
+  try {
+    parsed = JSON.parse(rawValue);
+  } catch {
+    throw new Error(
+      'Dataverse environment variable "carfup_IntuiZCredentials" contains invalid JSON.',
+    );
+  }
+
+  const { login, password, refClient } = parsed as Record<string, string>;
+
+  if (!login || typeof login !== 'string') {
+    throw new Error('Environment variable "carfup_IntuiZCredentials" is missing a valid "login" field.');
+  }
+  if (!password || typeof password !== 'string') {
+    throw new Error('Environment variable "carfup_IntuiZCredentials" is missing a valid "password" field.');
+  }
+  if (!refClient || typeof refClient !== 'string') {
+    throw new Error('Environment variable "carfup_IntuiZCredentials" is missing a valid "refClient" field.');
+  }
+
+  logger.info('IWS', 'IntuiZ credentials loaded successfully from environment variable.');
+  return { login, password, refClient };
+}
+
+/**
+ * Returns the cached IWS credentials, fetching them on first call.
+ * Call `resetCredentials()` to force a re-fetch (e.g. after an auth failure).
+ */
+function getCredentials(): Promise<IWSCredentials> {
+  if (!credentialsPromise) {
+    credentialsPromise = fetchCredentials();
+  }
+  return credentialsPromise;
+}
+
+/** Force re-fetching credentials on the next call. */
+export function resetCredentials(): void {
+  credentialsPromise = null;
+}
 
 export interface IWSSearchParams {
   qui?: string;        // Company name
@@ -51,8 +143,11 @@ export interface PaginatedResult {
  * Accepts the SearchCriteria interface (use toSearchCriteria() to convert from SearchFilters).
  */
 export async function rechercheSimple(criteria: SearchCriteria, debutResultat: number = 0): Promise<PaginatedResult> {
+  // Fetch credentials from Dataverse environment variable (cached after first call)
+  const creds = await getCredentials();
+
   const params = new URLSearchParams({
-    refClient: REF_CLIENT,
+    refClient: creds.refClient,
     categorieItemADeselectionner: 'false',
     categorieItemId: '',
     contexteRecherche: '',
@@ -87,7 +182,7 @@ export async function rechercheSimple(criteria: SearchCriteria, debutResultat: n
   const url = `${IWS_BASE_URL}/recherche-simple?${params.toString()}`;
   
   // Créer les credentials en Base64 pour Basic Auth
-  const credentials = btoa(`${IWS_USERNAME}:${IWS_PASSWORD}`);
+  const credentials = btoa(`${creds.login}:${creds.password}`);
 
   logger.info('IWS', `API Call: ${url}`);
 

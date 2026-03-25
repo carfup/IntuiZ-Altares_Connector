@@ -21,14 +21,11 @@ import {
   Link
 } from '@fluentui/react-components';
 import { 
-  LoupeIcon, 
   DatabaseIcon, 
-  EyeIcon, 
   ChevronUpIcon, 
   ChevronDownIcon, 
   ChevronUpDownIcon,
   PlusIcon,
-  QuestionMarkIcon,
   HeadquarterIcon,
   BranchIcon,
   CheckCircleIcon,
@@ -317,7 +314,6 @@ const ResultsGrid: React.FC<ResultsGridProps> = ({ data, onAddToCRM, pagination,
                 onClick={toggleSelectAll}
                 checkboxIndicator={{ "aria-label": "Select all rows" }}
               />
-              <TableHeaderCell style={{ textAlign: 'left', width: '60px' }}>View</TableHeaderCell>
               <SortableHeader label="SIRET" sortKey="siret" />
               <SortableHeader label="Company" sortKey="companyName" />
           
@@ -345,18 +341,6 @@ const ResultsGrid: React.FC<ResultsGridProps> = ({ data, onAddToCRM, pagination,
                     checkboxIndicator={{ "aria-label": "Select row" }}
                   />
                   
-                  <TableCell style={{ textAlign: 'center' }}>
-                     <Button 
-                       appearance="subtle" 
-                       icon={<LoupeIcon />} 
-                       as="a"
-                       href={company.websiteUrl || "#"}
-                       target="_blank"
-                       rel="noopener noreferrer"
-                       aria-label="View details"
-                     />
-                  </TableCell>
-
                   <TableCell>
                     <span className={styles.siret}>{company.siret}</span>
                   </TableCell>
@@ -434,13 +418,6 @@ const ResultsGrid: React.FC<ResultsGridProps> = ({ data, onAddToCRM, pagination,
          </div>
 
          <div className={styles.footerRight}>
-            <Button 
-              disabled={selectedIds.size === 0}
-              icon={<QuestionMarkIcon />}
-              onClick={() => console.log("Mark as unrecognized:", Array.from(selectedIds))}
-            >
-              Unrecognized
-            </Button>
             <Button 
               appearance="primary"
               disabled={selectedIds.size === 0 || isAdding}
